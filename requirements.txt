@@ -1,0 +1,12 @@
+# BioW-IPP Detector Requirements
+# Core dependencies for the detection pipeline
+
+# Standard library only - no external dependencies required for mock mode
+# For real LLM integration, uncomment below:
+
+# openai>=1.0.0
+# anthropic>=0.18.0
+
+# Optional: for enhanced visualization
+# matplotlib>=3.5.0
+# networkx>=2.8
