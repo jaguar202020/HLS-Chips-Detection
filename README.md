@@ -122,7 +122,7 @@ Step 3: Run Evaluation
   Avg Confidence: 0.87
 ```
 
-## For Professor Demo
+## For Demo
 
 This implementation can be demonstrated without actual hardware data:
 
