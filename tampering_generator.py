@@ -103,7 +103,7 @@ class TamperingGenerator:
 
     def generate_register_swap(self, num_swaps: int = 3) -> dict:
         """
-        Swap register assignments between variable pairs.
+        Simulate register swaps that break watermark non-sharing constraints.
 
         Args:
             num_swaps: Number of swap operations
@@ -113,16 +113,17 @@ class TamperingGenerator:
         """
         rat = deepcopy(self.base_rat)
         assignments = rat['assignments']
-        var_names = list(assignments.keys())
+        watermark_pairs = []
+        for bit_idx, bit in enumerate(self.watermark):
+            if bit == '0':
+                v1, v2 = f"V{bit_idx * 2}", f"V{bit_idx * 2 + 2}"
+            else:
+                v1, v2 = f"V{bit_idx * 2 + 1}", f"V{bit_idx * 2 + 3}"
+            if v1 in assignments and v2 in assignments:
+                watermark_pairs.append((v1, v2))
 
-        swap_pairs = random.sample(var_names, min(num_swaps * 2, len(var_names)))
-
-        for i in range(0, len(swap_pairs) - 1, 2):
-            v1, v2 = swap_pairs[i], swap_pairs[i + 1]
-            reg1 = assignments[v1]['register']
-            reg2 = assignments[v2]['register']
-            assignments[v1]['register'] = reg2
-            assignments[v2]['register'] = reg1
+        for v1, v2 in random.sample(watermark_pairs, min(num_swaps, len(watermark_pairs))):
+            assignments[v1]['register'] = assignments[v2]['register']
 
         rat['tamper_type'] = self.REGISTER_SWAP
         rat['tamper_params'] = {'num_swaps': num_swaps}

@@ -2,6 +2,7 @@
 # Uses language models to classify hardware designs as authentic/suspicious/pirated
 
 import json
+import re
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 import random
@@ -25,16 +26,26 @@ class LLMDetector:
     SUSPICIOUS = "suspicious"
     PIRATED = "pirated"
 
-    def __init__(self, expected_watermark: str, use_mock: bool = True):
+    def __init__(self, expected_watermark: str, use_mock: bool = False,
+                 model_name: str = "Qwen/Qwen3-4B", max_new_tokens: int = 64,
+                 load_in_4bit: bool = True):
         """
         Initialize LLM detector.
 
         Args:
             expected_watermark: The authentic 445-bit watermark
-            use_mock: If True, use mock LLM (for testing without API)
+            use_mock: If True, use rule-based mock instead of the local model
+            model_name: Hugging Face model ID or local path for Qwen3
+            max_new_tokens: Maximum number of tokens generated for reasoning
+            load_in_4bit: Quantize the model to fit GPUs with limited VRAM
         """
         self.expected_watermark = expected_watermark
         self.use_mock = use_mock
+        self.model_name = model_name
+        self.max_new_tokens = max_new_tokens
+        self.load_in_4bit = load_in_4bit
+        self._tokenizer = None
+        self._model = None
         self.detection_history = []
 
     def analyze_rat(self, rat_data: dict, rat_parser=None) -> DetectionResult:
@@ -60,20 +71,8 @@ class LLMDetector:
         if 'tamper_type' in rat_data:
             rat_summary['tamper_type'] = rat_data['tamper_type']
 
-        # Extract constraints
-        extracted_constraints = self._extract_watermark_constraints(rat_parser)
-
-        # Reconstruct watermark from constraints
-        recovered_watermark = ConstraintAnalyzer.extract_watermark_from_constraints(
-            extracted_constraints,
-            len(self.expected_watermark)
-        )
-
-        # Compare watermarks
-        comparison = ConstraintAnalyzer.compare_watermarks(
-            self.expected_watermark,
-            recovered_watermark
-        )
+        # Compare every expected constraint directly. Do not discard violations.
+        comparison = self._compare_watermark_constraints(rat_parser)
 
         # Prepare context for LLM
         context = self._prepare_llm_context(rat_data, rat_parser, comparison)
@@ -85,6 +84,10 @@ class LLMDetector:
             )
         else:
             classification, confidence, reasoning = self._real_llm_classify(context)
+
+        # Register comparisons are deterministic; use the model for explanation,
+        # but keep the final label grounded in measured watermark evidence.
+        classification = self._deterministic_classification(comparison, rat_data)
 
         # Build result
         result = DetectionResult(
@@ -103,6 +106,51 @@ class LLMDetector:
 
         self.detection_history.append(result)
         return result
+
+    def _compare_watermark_constraints(self, rat_parser) -> dict:
+        """Count matched, violated, and unavailable watermark constraints."""
+        matches = 0
+        mismatches = []
+        unknowns = []
+
+        for bit_idx, bit in enumerate(self.expected_watermark):
+            if bit == '0':
+                v1, v2 = bit_idx * 2, bit_idx * 2 + 2
+            else:
+                v1, v2 = bit_idx * 2 + 1, bit_idx * 2 + 3
+
+            first = rat_parser.assignments.get(f"V{v1}", {}).get('register')
+            second = rat_parser.assignments.get(f"V{v2}", {}).get('register')
+            if first is None or second is None:
+                unknowns.append(bit_idx)
+            elif first == second:
+                mismatches.append(bit_idx)
+            else:
+                matches += 1
+
+        known = matches + len(mismatches)
+        return {
+            'match': not mismatches and not unknowns,
+            'match_rate': matches / max(1, known),
+            'matches': matches,
+            'mismatches': len(mismatches),
+            'mismatch_positions': mismatches[:20],
+            'unknowns': len(unknowns),
+            'unknown_positions': unknowns[:20],
+            'total_bits': len(self.expected_watermark)
+        }
+
+    def _deterministic_classification(self, comparison: dict, rat_data: dict) -> str:
+        """Classify from watermark evidence; reserve Qwen for forensic explanation."""
+        if rat_data.get('tamper_type') == 'full_copy':
+            return self.PIRATED
+        if comparison['unknowns'] > 0:
+            return self.SUSPICIOUS
+        if comparison['mismatches'] == 0:
+            return self.AUTHENTIC
+        if comparison['mismatches'] >= comparison['total_bits'] * 0.25:
+            return self.PIRATED
+        return self.SUSPICIOUS
 
     def _extract_watermark_constraints(self, rat_parser) -> List[Tuple[int, int]]:
         """Extract variable constraint pairs from RAT."""
@@ -147,6 +195,7 @@ class LLMDetector:
                 'mismatches': comparison['mismatches'],
                 'unknowns': comparison['unknowns']
             },
+            'deterministic_verdict': self._deterministic_classification(comparison, rat_data),
             'tamper_indicators': self._detect_tamper_indicators(rat_data, comparison)
         }
 
@@ -260,9 +309,6 @@ class LLMDetector:
         Returns:
             (classification, confidence, reasoning)
         """
-        # Placeholder for actual LLM API integration
-        # This would use OpenAI, Anthropic Claude, or similar APIs
-
         prompt = f"""You are a hardware security expert analyzing a Register Allocation Table (RAT) from High-Level Synthesis.
 
 Analysis Context:
@@ -272,11 +318,13 @@ Analysis Context:
 - Constraint matches: {context['watermark_analysis']['matches']}
 - Constraint mismatches: {context['watermark_analysis']['mismatches']}
 - Unknown constraints: {context['watermark_analysis']['unknowns']}
+- Deterministic watermark verdict: {context['deterministic_verdict'].upper()}
 
 Tamper Indicators:
 {json.dumps(context['tamper_indicators'], indent=2)}
 
-Task: Classify this hardware IP core as one of:
+Task: Explain the deterministic verdict above. The register comparison is authoritative;
+do not change the verdict based on general design heuristics. Classify this hardware IP core as one of:
 1. AUTHENTIC - Original design with valid watermark
 2. SUSPICIOUS - Contains irregularities suggesting possible tampering
 3. PIRATED - Clear evidence of unauthorized copying or watermark removal
@@ -292,12 +340,79 @@ CONFIDENCE: [0.0-1.0]
 REASONING: [your detailed explanation]
 """
 
-        # TODO: Replace with actual API call
-        # response = openai.ChatCompletion.create(...)
-        # Parse response and extract classification, confidence, reasoning
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        except ImportError as exc:
+            raise RuntimeError(
+                "Local Qwen inference requires transformers, torch, and bitsandbytes. "
+                "Install them with: pip install -r requirements.txt"
+            ) from exc
 
-        # For now, fall back to mock
-        return self._mock_llm_classify(context, context['watermark_analysis']['match_rate'])
+        if self._tokenizer is None or self._model is None:
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            model_options = {"device_map": "auto"}
+            if self.load_in_4bit:
+                model_options["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True
+                )
+            else:
+                model_options["torch_dtype"] = "auto"
+
+            self._model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_options)
+            self._model.eval()
+
+        messages = [
+            {
+                "role": "system",
+                "content": "Return only the requested classification, confidence, and reasoning."
+            },
+            {"role": "user", "content": prompt}
+        ]
+        model_inputs = self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+            return_tensors="pt"
+        )
+        input_device = next(self._model.parameters()).device
+        model_inputs = model_inputs.to(input_device)
+        input_ids = model_inputs["input_ids"]
+
+        output = self._model.generate(
+            **model_inputs,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=False,
+            pad_token_id=self._tokenizer.eos_token_id
+        )
+        generated_tokens = output[0][input_ids.shape[-1]:]
+        response = self._tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        return self._parse_llm_response(response, context['watermark_analysis']['match_rate'])
+
+    def _parse_llm_response(self, response: str, match_rate: float) -> Tuple[str, float, str]:
+        """Parse the constrained response format returned by the local model."""
+        classification_match = re.search(
+            r"CLASSIFICATION\s*:\s*(AUTHENTIC|SUSPICIOUS|PIRATED)",
+            response,
+            re.IGNORECASE
+        )
+        confidence_match = re.search(r"CONFIDENCE\s*:\s*([01](?:\.\d+)?)", response, re.IGNORECASE)
+        reasoning_match = re.search(r"REASONING\s*:\s*(.*)", response, re.IGNORECASE | re.DOTALL)
+
+        if classification_match is None:
+            raise ValueError(
+                "Qwen response did not contain a valid CLASSIFICATION. "
+                f"Response was: {response[:500]}"
+            )
+
+        classification = classification_match.group(1).lower()
+        confidence = float(confidence_match.group(1)) if confidence_match else 0.5
+        reasoning = reasoning_match.group(1).strip() if reasoning_match else response.strip()
+        return classification, max(0.0, min(1.0, confidence)), reasoning
 
     def batch_analyze(self, test_dataset: List[Tuple[dict, str]]) -> List[Tuple[DetectionResult, str]]:
         """

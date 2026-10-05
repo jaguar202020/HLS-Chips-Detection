@@ -27,7 +27,7 @@ pipeline = BioWIPPPipeline(
     dna_sequence="ATGCGATCG" * 28,
     alpha_chain="MALWMRLLPLL" + "A" * 70,
     beta_chain="MALWMRLLPLLALLALWGPDP" + "A" * 95,
-    use_mock_llm=True  # Set False to use real LLM API
+    use_mock_llm=False  # Use local Qwen3-4B
 )
 
 # Generate test cases
@@ -42,52 +42,57 @@ print(pipeline.generate_report(metrics))
 
 ## Module Structure
 
-| Module | Description |
-|--------|-------------|
+| Module                   | Description                                         |
+| ------------------------ | --------------------------------------------------- |
 | `watermark_generator.py` | Converts DNA/protein sequences to 445-bit watermark |
-| `rat_parser.py` | Parses Register Allocation Tables from HLS |
-| `tampering_generator.py` | Generates synthetic piracy test scenarios |
-| `llm_detector.py` | LLM-based classification of designs |
-| `pipeline.py` | Complete end-to-end detection pipeline |
+| `rat_parser.py`          | Parses Register Allocation Tables from HLS          |
+| `tampering_generator.py` | Generates synthetic piracy test scenarios           |
+| `llm_detector.py`        | LLM-based classification of designs                 |
+| `pipeline.py`            | Complete end-to-end detection pipeline              |
 
 ## How It Works
 
 ### 1. Watermark Generation
+
 - DNA sequence → 248 bits (A=00, C=01, G=10, T=11)
 - Insulin Alpha chain → 81 bits (amino acid encoding)
 - Insulin Beta chain → 116 bits (amino acid encoding)
 - Combined: 81 + 248 + 116 = **445 bits**
 
 ### 2. Constraint Mapping
+
 - Bit 0 → even-even pair (V0, V2), (V2, V4), ...
 - Bit 1 → odd-odd pair (V1, V3), (V3, V5), ...
 - These pairs cannot share physical registers
 
 ### 3. Detection
-- Extract constraints from recovered RAT
-- Reconstruct watermark bits from constraints
-- Compare against vendor's expected watermark
-- LLM classifies: AUTHENTIC / SUSPICIOUS / PIRATED
+
+- Compare every expected constraint as matched, violated, or missing
+- Ground the classification in the deterministic watermark evidence
+- Use Qwen3 to produce the forensic explanation
+- Classify as AUTHENTIC / SUSPICIOUS / PIRATED
+
+## Local Qwen3 Model
+
+The detector uses `Qwen/Qwen3-4B` through Hugging Face Transformers by default.
+The model is downloaded and loaded the first time `analyze_rat` is called. To use
+a local model directory or another compatible Qwen3 checkpoint, pass `llm_model`.
+
+The first run requires enough disk space for the model and a compatible PyTorch
+device. `device_map="auto"` selects the available GPU or CPU automatically. The
+model uses 4-bit NF4 quantization by default so it fits on an 8 GB GPU. Set
+`load_in_4bit=False` when more VRAM is available.
 
 ## Testing with Mock LLM
 
 The system includes a mock LLM for demonstration without API access:
 
 ```python
-# Mock mode (default) - uses rule-based classification
+# Optional offline mock mode
 detector = LLMDetector(watermark, use_mock=True)
 
-# Real LLM mode - requires API configuration
+# Local Qwen3 mode (default)
 detector = LLMDetector(watermark, use_mock=False)
-```
-
-## Real LLM Integration
-
-To use with actual LLM APIs (OpenAI, Anthropic, etc.):
-
-```python
-# Configure in llm_detector.py _real_llm_classify method
-# Currently placeholder for API integration
 ```
 
 ## Demo
@@ -99,6 +104,7 @@ python -m biowipp_detector.pipeline
 ```
 
 Sample output:
+
 ```
 ============================================================
 BioW-IPP LLM Detection Pipeline - Demo

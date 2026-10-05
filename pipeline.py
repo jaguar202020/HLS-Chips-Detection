@@ -19,7 +19,7 @@ class BioWIPPPipeline:
     """Complete pipeline for BioW-IPP watermark detection using LLM."""
 
     def __init__(self, dna_sequence: str, alpha_chain: str, beta_chain: str,
-                 use_mock_llm: bool = True):
+                 use_mock_llm: bool = False, llm_model: str = "Qwen/Qwen3-4B"):
         """
         Initialize the detection pipeline.
 
@@ -27,7 +27,8 @@ class BioWIPPPipeline:
             dna_sequence: Vendor's DNA sequence
             alpha_chain: Insulin Alpha chain amino acid sequence
             beta_chain: Insulin Beta chain amino acid sequence
-            use_mock_llm: Use mock LLM for testing (no API required)
+            use_mock_llm: Use the rule-based mock instead of the local Qwen model
+            llm_model: Hugging Face model ID or local path for Qwen3
         """
         # Generate vendor's watermark
         self.watermark = generate_proteogenomic_watermark(
@@ -40,7 +41,11 @@ class BioWIPPPipeline:
         print(f"[Pipeline] Extracted {len(self.constraints)} watermark constraints")
 
         # Initialize components
-        self.detector = LLMDetector(self.watermark, use_mock=use_mock_llm)
+        self.detector = LLMDetector(
+            self.watermark,
+            use_mock=use_mock_llm,
+            model_name=llm_model
+        )
         self.rat_parser = RATParser()
 
     def load_rat(self, rat_data: Dict) -> bool:
@@ -70,12 +75,12 @@ class BioWIPPPipeline:
         """
         # Generate base RAT
         base_rat = generate_synthetic_rat(
-            num_variables=273,
+            num_variables=892,
             num_control_steps=31
         )
 
-        # Add watermark constraints to base RAT
-        for v1, v2, ctype in self.constraints[:100]:
+        # Add all watermark constraints to the synthetic base RAT
+        for v1, v2, ctype in self.constraints:
             v1_name = f"V{v1}"
             v2_name = f"V{v2}"
 
@@ -180,7 +185,7 @@ def run_demo():
         dna_sequence=dna_sequence,
         alpha_chain=alpha_chain,
         beta_chain=beta_chain,
-        use_mock_llm=True  # Use mock for demo (no API needed)
+        use_mock_llm=False  # Use local Qwen3; set True for the rule-based demo
     )
     print()
 
