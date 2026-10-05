@@ -2,6 +2,7 @@
 # Uses language models to classify hardware designs as authentic/suspicious/pirated
 
 import json
+import os
 import re
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
@@ -342,6 +343,7 @@ REASONING: [your detailed explanation]
 
         try:
             import torch
+            import transformers.modeling_utils as modeling_utils
             from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         except ImportError as exc:
             raise RuntimeError(
@@ -351,7 +353,10 @@ REASONING: [your detailed explanation]
 
         if self._tokenizer is None or self._model is None:
             self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            model_options = {"device_map": "auto"}
+            modeling_utils.caching_allocator_warmup = lambda *args, **kwargs: None
+            model_options = {
+                "device_map": "auto",
+            }
             if self.load_in_4bit:
                 model_options["quantization_config"] = BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -362,7 +367,15 @@ REASONING: [your detailed explanation]
             else:
                 model_options["torch_dtype"] = "auto"
 
-            self._model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_options)
+            try:
+                self._model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_options)
+            except OSError as exc:
+                if "paging file" in str(exc).lower() or "error 1455" in str(exc).lower():
+                    raise RuntimeError(
+                        "Windows could not map the Qwen checkpoint because the paging file is too small. "
+                        "Increase virtual memory to at least 16 GB and restart Windows, then retry."
+                    ) from exc
+                raise
             self._model.eval()
 
         messages = [
